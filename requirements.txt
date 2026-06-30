@@ -3,4 +3,4 @@ python-dotenv>=1.0.0
 python-telegram-bot>=20.0
 ollama>=0.1.7
 python-docx>=0.8.11
-sentence-transformers>=2.2.2
+pytest>=7.0.0

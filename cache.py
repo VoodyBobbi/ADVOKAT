@@ -1,54 +1,85 @@
+"""
+Кеш ответов на SQLite. Thread-safe, с TTL (время жизни записи).
+ВАЖНО: кеш работает только для вопросов БЕЗ контекста диалога —
+смотри логику в main.py (answer_question), где кеш пропускается
+для пользователей с активной историей переписки.
+"""
 import hashlib
-import json
-from typing import Optional
+import sqlite3
+import time
+import threading
 from pathlib import Path
+from typing import Optional
+
+from config import CACHE_DB_PATH, CACHE_TTL_SECONDS
 
 
 class ResponseCache:
-    def __init__(self, cache_file: str = "cache.json"):
-        self.cache_file = Path(cache_file)
-        self.cache = {}
-        self._load_cache()
+    def __init__(self, db_path: str = None, ttl_seconds: int = None):
+        self.db_path = Path(db_path or CACHE_DB_PATH)
+        self.ttl = ttl_seconds if ttl_seconds is not None else CACHE_TTL_SECONDS
+        self._lock = threading.Lock()
+        self._init_db()
 
-    def _get_cache_key(self, query: str) -> str:
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cache (
+                    key TEXT PRIMARY KEY,
+                    response TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON cache(created_at)")
+            conn.commit()
+
+    def _get_key(self, query: str) -> str:
         normalized = " ".join(query.lower().split())
-        return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
     def get(self, query: str) -> Optional[str]:
-        key = self._get_cache_key(query)
-        if key in self.cache:
-            print(f"✓ Кеш: ответ найден")
-            return self.cache[key]
-        print(f"✗ Кеш: ответ не найден")
+        key = self._get_key(query)
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT response, created_at FROM cache WHERE key = ?", (key,)
+                ).fetchone()
+        if row:
+            response, created_at = row
+            if time.time() - created_at < self.ttl:
+                return response
+            self._delete(key)
         return None
 
     def set(self, query: str, response: str) -> None:
-        key = self._get_cache_key(query)
-        self.cache[key] = response
-        self._save_cache()
-        print(f"✓ Ответ сохранён в кеш")
+        key = self._get_key(query)
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO cache (key, response, created_at) VALUES (?, ?, ?)",
+                    (key, response, time.time())
+                )
+                conn.commit()
 
-    def _save_cache(self) -> None:
-        try:
-            with open(self.cache_file, 'w', encoding='utf-8') as f:
-                json.dump(self.cache, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"⚠ Не удалось сохранить кеш: {e}")
-
-    def _load_cache(self) -> None:
-        if self.cache_file.exists():
-            try:
-                with open(self.cache_file, 'r', encoding='utf-8') as f:
-                    self.cache = json.load(f)
-                print(f"✓ Загружен кеш ({len(self.cache)} записей)")
-            except Exception:
-                self.cache = {}
+    def _delete(self, key: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+            conn.commit()
 
     def clear(self) -> None:
-        self.cache = {}
-        if self.cache_file.exists():
-            self.cache_file.unlink()
-        print("✓ Кеш очищен")
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM cache")
+                conn.commit()
+
+    def cleanup_expired(self) -> int:
+        cutoff = time.time() - self.ttl
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute("DELETE FROM cache WHERE created_at < ?", (cutoff,))
+                conn.commit()
+                return cursor.rowcount
 
     def size(self) -> int:
-        return len(self.cache)
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]

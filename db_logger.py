@@ -1,13 +1,21 @@
+"""
+Логирование всех взаимодействий с ботом в SQLite (logs.db).
+Что сюда пишется: вопрос пользователя, ответ агента, кто спросил,
+откуда (telegram/console), был ли ответ из кеша, сколько мс занял ответ.
+Используется для статистики (/stats) и для восстановления памяти диалога.
+"""
 import sqlite3
 import csv
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
 
+from config import DB_PATH
+
 
 class DatabaseLogger:
-    def __init__(self, db_path: str = "logs.db"):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: str = None):
+        self.db_path = Path(db_path or DB_PATH)
         self._init_database()
 
     def _init_database(self) -> None:
@@ -68,7 +76,6 @@ class DatabaseLogger:
         }
 
     def export_to_csv(self, output_path: str = "logs_export.csv") -> str:
-        """Экспортирует все записи из logs.db в CSV-файл."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("""
@@ -93,7 +100,6 @@ class DatabaseLogger:
         return output_path
 
     def get_history(self, user_id: str, limit: int = 20) -> list:
-        """Возвращает последние N записей диалога конкретного пользователя."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("""
