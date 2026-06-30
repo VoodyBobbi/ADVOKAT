@@ -1,9 +1,16 @@
 import sqlite3
-from typing import List, Dict
+from typing import List, Dict, Tuple
+from document_index_manager import DocumentIndexManager
+from config import MODEL_NAME, OLLAMA_CHAT_URL, DB_PATH, MAX_MEMORY_MESSAGES, MEMORY_RESTORE_LIMIT
 
-from config import MODEL_NAME, OLLAMA_CHAT_URL, DB_PATH, MAX_MEMORY_MESSAGES, MEMORY_RESTORE_LIMIT, SEARCH_TOP_K
-
+# ВОССТАНОВЛЕННЫЙ ПРОМПТ С ДОБАВЛЕНИЕМ СТРОГИХ ПРАВИЛ
 SYSTEM_PROMPT = """Ты — агент-адвокат. Твоя единственная задача — квалифицировать описанные действия по УК РФ максимально точно и объективно.
+
+**НЕУКОСНИТЕЛЬНЫЕ ПРАВИЛА (ВАЖНЕЕ ВСЕГО):**
+1.  **ЯЗЫК:** Ты отвечаешь **ВСЕГДА ТОЛЬКО НА РУССКОМ ЯЗЫКЕ**.
+2.  **НЕДОСТАТОЧНО ИНФОРМАЦИИ:** Если в «КОНТЕКСТЕ ИЗ ЗАКОНА» нет подходящих статей для ответа на вопрос пользователя (например, вопрос "я съел рыбу"), ты **ОБЯЗАН** ответить только одной фразой: `ИНФОРМАЦИИ НЕДОСТАТОЧНО`. Ничего больше.
+
+---
 
 ━━━━ ПРИНЦИПЫ РАБОТЫ ━━━━
 
@@ -46,23 +53,14 @@ SYSTEM_PROMPT = """Ты — агент-адвокат. Твоя единстве
 
 
 class RAGAssistant:
-    def __init__(self, embedding_store, model_name: str = None):
-        self.embedding_store = embedding_store
+    def __init__(self, index_manager: DocumentIndexManager, model_name: str = None):
+        self.index_manager = index_manager
         self.model_name = model_name or MODEL_NAME
-        # Память хранится отдельно для КАЖДОГО user_id — это ключ словаря.
-        # Когда боту пишут разные люди (из разных городов/стран), Telegram
-        # передаёт уникальный user_id для каждого из них, поэтому диалоги
-        # никогда не путаются между собой — у каждого свой изолированный контекст.
         self.memory: Dict[str, List[Dict[str, str]]] = {}
         print(f"✓ RAG-ассистент с памятью готов (модель: {self.model_name})")
 
-    def _restore_memory_from_db(self, user_id: str, limit: int = None):
-        """
-        Загружает последние N диалогов КОНКРЕТНОГО пользователя из logs.db.
-        Вызывается один раз — при первом сообщении пользователя после
-        перезапуска бота, чтобы он не забывал, о чём вы говорили раньше.
-        """
-        restore_limit = limit or MEMORY_RESTORE_LIMIT
+    def _restore_memory_from_db(self, user_id: str):
+        """Загружает последние N диалогов пользователя из logs.db."""
         try:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
@@ -71,7 +69,7 @@ class RAGAssistant:
                 WHERE user_id = ? AND from_cache = 0
                 ORDER BY timestamp DESC
                 LIMIT ?
-            """, (user_id, restore_limit))
+            """, (user_id, MEMORY_RESTORE_LIMIT))
             rows = cursor.fetchall()
             conn.close()
 
@@ -83,20 +81,20 @@ class RAGAssistant:
         except Exception as e:
             print(f"⚠ Не удалось восстановить память для {user_id}: {e}")
 
-    def update_memory(self, user_id: str, role: str, content: str, max_messages: int = None):
-        """Добавляет сообщение в историю КОНКРЕТНОГО пользователя (скользящее окно)."""
-        limit = max_messages or MAX_MEMORY_MESSAGES
+    def update_memory(self, user_id: str, role: str, content: str):
+        """Добавляет сообщение в историю пользователя (скользящее окно)."""
         if user_id not in self.memory:
             self.memory[user_id] = []
         self.memory[user_id].append({"role": role, "content": content})
-        if len(self.memory[user_id]) > limit:
-            self.memory[user_id] = self.memory[user_id][-limit:]
+        if len(self.memory[user_id]) > MAX_MEMORY_MESSAGES:
+            self.memory[user_id] = self.memory[user_id][-MAX_MEMORY_MESSAGES:]
 
     def get_memory(self, user_id: str) -> List[Dict[str, str]]:
         return self.memory.get(user_id, [])
 
     def clear_memory(self, user_id: str):
-        self.memory[user_id] = []
+        if user_id in self.memory:
+            self.memory[user_id] = []
 
     def _build_messages(self, query: str, context: str, user_id: str) -> List[Dict[str, str]]:
         system_with_context = (
@@ -109,75 +107,55 @@ class RAGAssistant:
         messages.append({"role": "user", "content": query})
         return messages
 
-    def generate_response(self, query: str, user_id: str = "console", top_k: int = None):
-        """
-        Основной метод. user_id ОБЯЗАТЕЛЬНО разный для каждого человека —
-        в Telegram это str(update.effective_user.id), уникальный для каждого
-        отправителя. Поэтому два разных человека из разных стран никогда
-        не увидят историю переписки друг друга.
-        """
-        search_top_k = top_k or SEARCH_TOP_K
-
-        # Восстанавливаем память один раз — если для этого user_id ещё
-        # ничего нет в текущей сессии бота (например, после перезапуска).
+    def generate_response(self, query: str, user_id: str = "console") -> Tuple[str, List[Dict]]:
+        """Основной метод генерации ответа."""
         if user_id not in self.memory:
             self._restore_memory_from_db(user_id)
 
-        search_results = self.embedding_store.search(query, top_k=search_top_k)
+        # 1. Поиск документов
+        search_results = self.index_manager.search(query)
 
         if not search_results:
-            answer = (
-                "Не нашёл подходящие статьи в базе по этому запросу. "
-                "Попробуй переформулировать или уточни, какие именно действия тебя интересуют."
-            )
+            # Если поиск ничего не нашел, сразу отвечаем по правилу
+            answer = "ИНФОРМАЦИИ НЕДОСТАТОЧНО"
             self.update_memory(user_id, "user", query)
             self.update_memory(user_id, "assistant", answer)
             return answer, []
 
+        # 2. Формирование контекста для LLM
         context = "\n\n---\n\n".join(
-            [f"[Источник: {source}]\n{chunk}" for i, (chunk, source, _) in enumerate(search_results)]
+            [f"[Источник: {doc['source']}, релевантность: {doc['score']:.2f}]\n{doc['text']}"
+             for doc in search_results]
         )
 
+        # 3. Генерация ответа
         messages = self._build_messages(query, context, user_id)
         answer = self._call_ollama(messages)
 
+        # 4. Обновление памяти
         self.update_memory(user_id, "user", query)
         self.update_memory(user_id, "assistant", answer)
 
         return answer, search_results
 
     def _call_ollama(self, messages: List[Dict[str, str]]) -> str:
+        """Вызывает Ollama."""
         try:
             import ollama
             response = ollama.chat(
                 model=self.model_name,
                 messages=messages,
-                options={"temperature": 0.3, "num_predict": 1024}
+                options={"temperature": 0.2} # Температура чуть выше для более естественного языка
             )
             return response["message"]["content"].strip()
-        except ImportError:
-            return self._call_ollama_http(messages)
         except Exception as e:
-            return f"Ошибка при обращении к модели: {str(e)}"
-
-    def _call_ollama_http(self, messages: List[Dict[str, str]]) -> str:
-        import json
-        import urllib.request
-        try:
-            payload = json.dumps({
-                "model": self.model_name,
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0.3, "num_predict": 1024}
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                OLLAMA_CHAT_URL,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return data["message"]["content"].strip()
-        except Exception as e:
-            return f"Ошибка HTTP API Ollama: {str(e)}"
+            try:
+                import json
+                import urllib.request
+                payload = json.dumps({"model": self.model_name, "messages": messages, "stream": False, "options": {"temperature": 0.2}}).encode("utf-8")
+                req = urllib.request.Request(OLLAMA_CHAT_URL, data=payload, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    return data["message"]["content"].strip()
+            except Exception as http_e:
+                return f"Ошибка при обращении к модели: {e} (HTTP fallback: {http_e})"

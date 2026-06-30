@@ -1,6 +1,16 @@
+"""
+Интерфейс для Telegram.
+
+Отвечает только за:
+- Приём сообщений от пользователя.
+- Передачу запроса в сервисный слой (QueryService).
+- Отправку готового ответа пользователю.
+- Обработку команд (/start, /clear, /stats).
+
+Этот модуль не содержит никакой бизнес-логики.
+"""
 import asyncio
-import subprocess
-import sys
+import os
 import time
 import logging
 import urllib.request
@@ -9,8 +19,18 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes
 )
-from main import initialize_system, answer_question
-from config import TELEGRAM_BOT_TOKEN
+from main import initialize_system
+from config import TELEGRAM_BOT_TOKEN, OLLAMA_URL
+
+# Исправление для Windows: принудительно указываем правильный адрес Ollama
+if OLLAMA_URL:
+    try:
+        host, port = OLLAMA_URL.replace("http://", "").split(":")
+        os.environ["OLLAMA_HOST"] = host
+        os.environ["OLLAMA_PORT"] = port
+    except ValueError:
+        print(f"Неверный формат OLLAMA_URL: {OLLAMA_URL}. Ожидается http://host:port")
+
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -23,6 +43,7 @@ _last_seen: dict[str, float] = {}
 
 
 def _is_flooding(user_id: str) -> bool:
+    """Простая защита от флуда."""
     now = time.time()
     if user_id in _last_seen and now - _last_seen[user_id] < MIN_INTERVAL:
         return True
@@ -44,14 +65,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    rag = context.bot_data["rag"]
-    rag.clear_memory(user_id)
+    service = context.bot_data["service"]
+    service.clear_user_memory(user_id)
     await update.message.reply_text("Разговор очищен. Начнём заново — расскажи, что случилось.")
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_db = context.bot_data["logger"]
-    stats = log_db.get_stats()
+    service = context.bot_data["service"]
+    stats = service.get_statistics()
     text = (
         f"Всего запросов: {stats['total_requests']}\n"
         f"Из кеша: {stats['cached_requests']}\n"
@@ -63,8 +84,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # user.id уникален для каждого человека в Telegram — поэтому переписка
-    # одного человека никогда не путается с перепиской другого.
     user_id = str(user.id)
     username = user.username or user.first_name or "Unknown"
     query = update.message.text.strip()
@@ -76,12 +95,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Подожди секунду перед следующим вопросом.")
         return
 
-    rag = context.bot_data["rag"]
-    cache = context.bot_data["cache"]
-    log_db = context.bot_data["logger"]
+    service = context.bot_data["service"]
 
-    # Индикатор "печатает..." живёт 5 сек, а Ollama думает дольше —
-    # обновляем индикатор каждые 4 секунды пока считается ответ.
+    # Индикатор "печатает..."
     async def keep_typing():
         while True:
             await context.bot.send_chat_action(
@@ -93,16 +109,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     typing_task = asyncio.create_task(keep_typing())
 
     try:
+        # Вызываем единый метод сервисного слоя
         answer = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: answer_question(
+            lambda: service.answer_query(
                 query=query,
-                rag=rag,
-                cache=cache,
-                logger=log_db,
-                source="telegram",
                 user_id=user_id,
-                username=username
+                username=username,
+                source="telegram"
             )
         )
     finally:
@@ -112,6 +126,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.CancelledError:
             pass
 
+    # Отправка ответа
     if len(answer) > 4096:
         for i in range(0, len(answer), 4096):
             await update.message.reply_text(answer[i:i + 4096])
@@ -119,76 +134,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(answer)
 
 
-def _is_ollama_running(url: str = "http://localhost:11434", timeout: float = 2.0) -> bool:
-    try:
-        urllib.request.urlopen(url, timeout=timeout)
-        return True
-    except Exception:
-        return False
-
-
-def _ensure_ollama_running(max_wait: float = 20.0):
-    """
-    Если Ollama уже отвечает (например, запущен через десктоп-приложение
-    с автозапуском) — ничего не делает, просто идём дальше.
-    Если нет — поднимает `ollama serve` в фоне без видимого окна консоли
-    и ждёт, реально опрашивая сервер каждые полсекунды, а не по таймеру.
-    Процесс остаётся жить после закрытия бота — при следующем запуске
-    Ollama уже будет наготове.
-    """
-    if _is_ollama_running():
-        logger.info("Ollama уже запущен")
-        return
-
-    logger.info("Ollama не отвечает, пробую запустить автоматически...")
-
-    popen_kwargs = {}
-    if sys.platform == "win32":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-    try:
-        subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            **popen_kwargs
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "Команда 'ollama' не найдена в системе. Проверь, что Ollama "
-            "установлен (попробуй вручную в терминале: ollama list)."
-        )
-    except Exception as e:
-        raise RuntimeError(f"Не удалось запустить Ollama автоматически: {e}")
-
-    waited = 0.0
-    step = 0.5
-    while waited < max_wait:
-        if _is_ollama_running():
-            logger.info(f"Ollama поднялся за {waited:.1f} сек")
-            return
-        time.sleep(step)
-        waited += step
-
-    raise RuntimeError(
-        f"Ollama не ответил за {max_wait:.0f} сек после автозапуска. "
-        "Попробуй вручную: открой терминал, введи 'ollama serve' и посмотри, "
-        "что он пишет — там будет настоящая причина."
-    )
-
-
 def run_bot():
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN не задан в .env")
 
-    _ensure_ollama_running()
+    # Проверяем, что Ollama запущен
+    try:
+        urllib.request.urlopen(OLLAMA_URL, timeout=3)
+    except Exception:
+        raise RuntimeError(f"Ollama не отвечает по адресу {OLLAMA_URL}! Запусти приложение Ollama и попробуй снова.")
 
-    _, rag, cache, log_db = initialize_system()
+    # Инициализируем всю систему и получаем один объект-сервис
+    query_service = initialize_system()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.bot_data["rag"] = rag
-    app.bot_data["cache"] = cache
-    app.bot_data["logger"] = log_db
+    # Передаём в контекст только один объект
+    app.bot_data["service"] = query_service
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
